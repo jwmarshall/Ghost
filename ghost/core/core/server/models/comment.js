@@ -290,35 +290,115 @@ const Comment = ghostBookshelf.Model.extend({
             replyRelationKeys.push('replies.count.reports');
         }
 
+        // The top-level reply counts are otherwise emitted by the include-count plugin as per-row
+        // correlated subqueries that self-join the comments table once per returned row, which is
+        // catastrophically slow at scale. Strip them here and compute them in a single batched
+        // grouped pass over the page's ids instead (see attachReplyCounts). These two counts are
+        // never used for ordering (orderAttributes only whitelists likes/net_score/reports), so
+        // removing them from the SELECT is safe. The nested 'replies.count.direct_replies' relation
+        // is a different key and is left untouched (batch-loaded above).
+        const batchedCountKeys = ['count.replies', 'count.direct_replies'];
+        const requestedBatchedCounts = new Set();
+
         // Remove reply relations from options.withRelated to avoid double-loading
         // and collect them for batch loading via Collection.load()
         const relationsToLoadInBatch = [];
-        const isReplyRelation = (rel) => {
-            const name = typeof rel === 'string' ? rel : Object.keys(rel)[0];
-            return replyRelationKeys.includes(name);
-        };
+        const relationName = rel => (typeof rel === 'string' ? rel : Object.keys(rel)[0]);
         options.withRelated = withRelated.filter((rel) => {
-            if (isReplyRelation(rel)) {
+            const name = relationName(rel);
+            if (replyRelationKeys.includes(name)) {
                 relationsToLoadInBatch.push(rel);
+                return false;
+            }
+            if (batchedCountKeys.includes(name)) {
+                requestedBatchedCounts.add(name);
                 return false;
             }
             return true;
         });
 
-        // Base findPage WITHOUT reply relations
+        // Base findPage WITHOUT reply relations or the batched top-level counts
         const result = await ghostBookshelf.Model.findPage.call(this, options);
 
-        // Batch-load reply relations for ALL comments at once using Collection.load()
-        // instead of the previous N+1 per-model model.load() loop
-        if (result.data.length > 0 && relationsToLoadInBatch.length > 0) {
-            const parentIds = result.data.map(model => model.id);
-            this.applyRepliesWithRelatedOption(relationsToLoadInBatch, options.isAdmin, parentIds);
+        if (result.data.length > 0) {
+            // Batch-load reply relations for ALL comments at once using Collection.load()
+            // instead of the previous N+1 per-model model.load() loop
+            if (relationsToLoadInBatch.length > 0) {
+                const parentIds = result.data.map(model => model.id);
+                this.applyRepliesWithRelatedOption(relationsToLoadInBatch, options.isAdmin, parentIds);
 
-            const collection = ghostBookshelf.Collection.forge(result.data, {model: this});
-            await collection.load(relationsToLoadInBatch, _.omit(options, 'withRelated', 'columns', 'selectRaw'));
+                const collection = ghostBookshelf.Collection.forge(result.data, {model: this});
+                await collection.load(relationsToLoadInBatch, _.omit(options, 'withRelated', 'columns', 'selectRaw'));
+            }
+
+            if (requestedBatchedCounts.size > 0) {
+                await this.attachReplyCounts(result.data, requestedBatchedCounts, options.isAdmin);
+            }
         }
 
         return result;
+    },
+
+    /**
+     * Sets the count__replies / count__direct_replies attributes on a page of comment models
+     * using batched GROUP BY queries over the page's ids, rather than the per-row correlated
+     * subqueries the include-count plugin would otherwise emit. Values are stored as count__*
+     * attributes so the serializer nests them under `count` in the API response, identically to
+     * the per-row path.
+     *
+     * @param {object[]} models - the page of comment models (result.data)
+     * @param {Set<string>} requestedBatchedCounts - which of 'count.replies'/'count.direct_replies' were requested
+     * @param {boolean} isAdmin - whether this is an admin request (changes which statuses are excluded)
+     */
+    async attachReplyCounts(models, requestedBatchedCounts, isAdmin) {
+        const ids = models.map(model => model.id);
+        // Mirror countRelations(): admin counts exclude only deleted comments, the public API also excludes hidden ones.
+        const excludedStatuses = isAdmin ? ['deleted'] : ['hidden', 'deleted'];
+        const knex = ghostBookshelf.knex;
+
+        const wantReplies = requestedBatchedCounts.has('count.replies');
+        const wantDirectReplies = requestedBatchedCounts.has('count.direct_replies');
+
+        const toCountMap = (rows, key) => {
+            const map = new Map();
+            for (const row of rows) {
+                // COUNT(*) comes back as a string on MySQL, a number on SQLite — normalise.
+                map.set(row[key], Number(row.count));
+            }
+            return map;
+        };
+
+        // direct_replies is the sum of two disjoint sets (matching countRelations().direct_replies):
+        //   A) direct children of the comment (parent_id = id) that are not themselves a reply (in_reply_to_id IS NULL)
+        //   B) comments that reply directly to the comment (in_reply_to_id = id)
+        // Splitting avoids an OR across parent_id/in_reply_to_id, which would defeat index usage.
+        const [repliesRows, directRepliesA, directRepliesB] = await Promise.all([
+            wantReplies
+                ? knex('comments').select('parent_id').count('* as count')
+                    .whereIn('parent_id', ids).whereNotIn('status', excludedStatuses).groupBy('parent_id')
+                : [],
+            wantDirectReplies
+                ? knex('comments').select('parent_id').count('* as count')
+                    .whereIn('parent_id', ids).whereNull('in_reply_to_id').whereNotIn('status', excludedStatuses).groupBy('parent_id')
+                : [],
+            wantDirectReplies
+                ? knex('comments').select('in_reply_to_id').count('* as count')
+                    .whereIn('in_reply_to_id', ids).whereNotIn('status', excludedStatuses).groupBy('in_reply_to_id')
+                : []
+        ]);
+
+        const repliesMap = toCountMap(repliesRows, 'parent_id');
+        const directRepliesAMap = toCountMap(directRepliesA, 'parent_id');
+        const directRepliesBMap = toCountMap(directRepliesB, 'in_reply_to_id');
+
+        for (const model of models) {
+            if (wantReplies) {
+                model.set('count__replies', repliesMap.get(model.id) || 0);
+            }
+            if (wantDirectReplies) {
+                model.set('count__direct_replies', (directRepliesAMap.get(model.id) || 0) + (directRepliesBMap.get(model.id) || 0));
+            }
+        }
     },
 
     countRelations() {
