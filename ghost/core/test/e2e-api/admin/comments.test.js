@@ -497,30 +497,38 @@ describe(`Admin Comments API`, function () {
                 member_id: fixtureManager.get('members', 0).id,
                 html: 'Comment 1',
                 status: 'published',
+                // Distinct created_at so the created_at-ASC reply order is deterministic and
+                // matches insertion/id order — the cursor below relies on a stable order.
                 replies: [{
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 1',
-                    status: 'published'
+                    status: 'published',
+                    created_at: new Date('2025-01-01T00:00:01.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 2',
-                    status: 'hidden'
+                    status: 'hidden',
+                    created_at: new Date('2025-01-01T00:00:02.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 3',
-                    status: 'hidden'
+                    status: 'hidden',
+                    created_at: new Date('2025-01-01T00:00:03.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 4',
-                    status: 'hidden'
+                    status: 'hidden',
+                    created_at: new Date('2025-01-01T00:00:04.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 5',
-                    status: 'published'
+                    status: 'published',
+                    created_at: new Date('2025-01-01T00:00:05.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 6',
-                    status: 'published'
+                    status: 'published',
+                    created_at: new Date('2025-01-01T00:00:06.000Z')
                 }]
             });
 
@@ -539,22 +547,28 @@ describe(`Admin Comments API`, function () {
                 member_id: fixtureManager.get('members', 0).id,
                 html: 'Comment 1',
                 status: 'published',
+                // Distinct created_at so the created_at-ASC reply order is deterministic and
+                // matches insertion/id order — the cursor below relies on a stable order.
                 replies: [{
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 1',
-                    status: 'published'
+                    status: 'published',
+                    created_at: new Date('2025-01-01T00:00:01.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 2',
-                    status: 'hidden'
+                    status: 'hidden',
+                    created_at: new Date('2025-01-01T00:00:02.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 3',
-                    status: 'hidden'
+                    status: 'hidden',
+                    created_at: new Date('2025-01-01T00:00:03.000Z')
                 }, {
                     member_id: fixtureManager.get('members', 0).id,
                     html: 'Reply 4',
-                    status: 'hidden'
+                    status: 'hidden',
+                    created_at: new Date('2025-01-01T00:00:04.000Z')
                 }]
             });
 
@@ -1081,6 +1095,88 @@ describe(`Admin Comments API`, function () {
             // count.replies = 2 (all are direct, so same as direct_replies)
             assert.equal(rootComment.count.replies, 2);
             assert.equal(rootComment.count.direct_replies, 2);
+        });
+    });
+
+    // The top-level count.replies / count.direct_replies are computed in a single batched
+    // GROUP BY pass over the current page's comment ids (models.Comment.findPage), rather than
+    // per-row correlated subqueries. These tests lock the behaviours that batching could regress.
+    describe('Batched reply counts (browse-all)', function () {
+        it('returns an empty list with no error when there are no comments', async function () {
+            const res = await adminApi.get('/comments/').expectStatus(200);
+            assert.equal(res.body.comments.length, 0);
+        });
+
+        it('computes distinct per-root counts in a single page (no cross-id contamination)', async function () {
+            const m0 = fixtureManager.get('members', 0).id;
+            const m1 = fixtureManager.get('members', 1).id;
+
+            // Root A: 2 direct replies
+            const rootA = await dbFns.addComment({member_id: m0, html: '<p>Root A</p>'});
+            await dbFns.addComment({member_id: m1, parent_id: rootA.get('id'), html: '<p>A1</p>'});
+            await dbFns.addComment({member_id: m1, parent_id: rootA.get('id'), html: '<p>A2</p>'});
+
+            // Root B: no replies
+            const rootB = await dbFns.addComment({member_id: m0, html: '<p>Root B</p>'});
+
+            // Root C: 1 direct reply (C1) + 1 nested reply to C1 (counts toward replies, not direct_replies)
+            const rootC = await dbFns.addComment({member_id: m0, html: '<p>Root C</p>'});
+            const c1 = await dbFns.addComment({member_id: m1, parent_id: rootC.get('id'), html: '<p>C1</p>'});
+            await dbFns.addComment({member_id: m1, parent_id: rootC.get('id'), in_reply_to_id: c1.get('id'), html: '<p>C2</p>'});
+
+            const res = await adminApi.get('/comments/?include_nested=false').expectStatus(200);
+            const byId = Object.fromEntries(res.body.comments.map(c => [c.id, c]));
+
+            assert.equal(byId[rootA.get('id')].count.replies, 2);
+            assert.equal(byId[rootA.get('id')].count.direct_replies, 2);
+            assert.equal(byId[rootB.get('id')].count.replies, 0);
+            assert.equal(byId[rootB.get('id')].count.direct_replies, 0);
+            assert.equal(byId[rootC.get('id')].count.replies, 2);
+            assert.equal(byId[rootC.get('id')].count.direct_replies, 1);
+        });
+
+        it('sums the two direct_replies sources without double-counting', async function () {
+            const m0 = fixtureManager.get('members', 0).id;
+            const m1 = fixtureManager.get('members', 1).id;
+
+            const root = await dbFns.addComment({member_id: m0, html: '<p>Root</p>'});
+            // Source A: direct child (parent_id = root, in_reply_to_id IS NULL)
+            const directChild = await dbFns.addComment({member_id: m1, parent_id: root.get('id'), html: '<p>direct child</p>'});
+            // Source B: reply addressed to the root itself (in_reply_to_id = root)
+            await dbFns.addComment({member_id: m1, parent_id: root.get('id'), in_reply_to_id: root.get('id'), html: '<p>reply to root</p>'});
+            // Neither source: reply to the direct child (counts in replies, not direct_replies)
+            await dbFns.addComment({member_id: m1, parent_id: root.get('id'), in_reply_to_id: directChild.get('id'), html: '<p>nested</p>'});
+
+            const res = await adminApi.get('/comments/?include_nested=false').expectStatus(200);
+            const rootResult = res.body.comments.find(c => c.id === root.get('id'));
+
+            // replies = 3 (all three share parent_id = root)
+            assert.equal(rootResult.count.replies, 3);
+            // direct_replies = 2: source A (1) + source B (1); the nested reply belongs to neither
+            assert.equal(rootResult.count.direct_replies, 2);
+        });
+
+        it('computes counts per page, not across the whole table', async function () {
+            const m0 = fixtureManager.get('members', 0).id;
+            const m1 = fixtureManager.get('members', 1).id;
+
+            const older = await dbFns.addComment({member_id: m0, html: '<p>Older root</p>', created_at: new Date('2024-01-01T00:00:00.000Z')});
+            await dbFns.addComment({member_id: m1, parent_id: older.get('id'), html: '<p>o1</p>'});
+
+            const newer = await dbFns.addComment({member_id: m0, html: '<p>Newer root</p>', created_at: new Date('2025-01-01T00:00:00.000Z')});
+            await dbFns.addComment({member_id: m1, parent_id: newer.get('id'), html: '<p>n1</p>'});
+            await dbFns.addComment({member_id: m1, parent_id: newer.get('id'), html: '<p>n2</p>'});
+
+            // Default order is created_at desc → page 1 is the newer root, page 2 the older root.
+            const page1 = await adminApi.get('/comments/?include_nested=false&limit=1&page=1').expectStatus(200);
+            assert.equal(page1.body.comments.length, 1);
+            assert.equal(page1.body.comments[0].id, newer.get('id'));
+            assert.equal(page1.body.comments[0].count.replies, 2);
+
+            const page2 = await adminApi.get('/comments/?include_nested=false&limit=1&page=2').expectStatus(200);
+            assert.equal(page2.body.comments.length, 1);
+            assert.equal(page2.body.comments[0].id, older.get('id'));
+            assert.equal(page2.body.comments[0].count.replies, 1);
         });
     });
 
